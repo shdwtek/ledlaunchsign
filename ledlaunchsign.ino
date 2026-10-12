@@ -1,4 +1,3 @@
-#include <time.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -8,14 +7,15 @@
 #include <Adafruit_NeoPixel.h>
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
+#include <time.h> // Required for NTP syncing
 
 // --- Configuration ---
 const char* ssid = "SSID";
 const char* password = "PASSWORD";
-const char* apiUrl = "apiURL";
+const char* apiUrl = "API_URL";
 
 // --- Hardware Pins ---
-#define LED_PIN 15 // GP15 (Physical Pin 20) for WS2812B Data
+#define LED_PIN 15 // GP15 (Physical Pin 20)
 
 // --- OLED Setup ---
 #define SCREEN_WIDTH 128
@@ -23,25 +23,33 @@ const char* apiUrl = "apiURL";
 #define OLED_RESET -1 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// --- LED Matrix Setup (2 Units: 64x8) ---
-// Using COLUMNS + ZIGZAG and NEO_RGB based on your hardware tests
-Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(64, 8, LED_PIN,
+// --- LED Matrix Setup (4 Units: 128x8) ---
+const int MATRIX_WIDTH = 128;
+Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(MATRIX_WIDTH, 8, LED_PIN,
   NEO_MATRIX_TOP     + NEO_MATRIX_LEFT +
   NEO_MATRIX_COLUMNS + NEO_MATRIX_ZIGZAG, 
-  NEO_RGB            + NEO_KHZ800);       
+  NEO_GRB            + NEO_KHZ800);       
 
 // --- Global Variables ---
 String mainText = "Loading...";
-unsigned long launchTimestamp = 0;
+unsigned long launchTimestamp = 0; 
 long timeUntilLaunch = 0;
 bool isCountingDown = false;
 bool postLaunchFetchTriggered = false;
 unsigned long lastTickTime = 0;
 unsigned long zeroHitTime = 0;
-int cursorX = 64; 
+int cursorX = MATRIX_WIDTH; 
 
-// Array to hold our rolling console messages (reduced to 5 lines for the timer)
 String consoleLines[5] = {"", "", "", "", ""};
+
+// --- OLED Scrolling Variables ---
+String globalLaunchName = "";
+bool displayScrollingName = false;
+bool needsOledScroll = false;
+int oledCursorX = 0;
+unsigned long lastOledUpdateTime = 0;
+unsigned long dataSyncedTime = 0;
+bool pendingNameScroll = false;
 
 // --- Function Prototypes ---
 void printConsole(String msg);
@@ -52,29 +60,31 @@ String formatCountdown(long seconds);
 void updateDisplay();
 
 void setup() {
-  // Give the hardware 2 seconds to stabilize power before hitting the WiFi radio
   delay(2000); 
   Serial.begin(115200);
   
-  // Initialize OLED (Default I2C pins for Pico: SDA=GP4, SCL=GP5)
   Wire.setSDA(4);
   Wire.setSCL(5);
   Wire.begin();
   
+  // Speed up I2C to 400kHz so the OLED animation doesn't lag the LED matrix
+  Wire.setClock(400000); 
+  
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
     Serial.println(F("SSD1306 allocation failed"));
-    for(;;); // Don't proceed, loop forever
+    for(;;); 
   }
   
+  display.setTextWrap(false);
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   printConsole("System Booting...");
   
-  // Initialize LED Matrix
   matrix.begin();
   matrix.setTextWrap(false);
-  matrix.setBrightness(40); // Safe brightness for USB testing
+  matrix.setBrightness(40); // 0-255
   
   connectWiFi();
   fetchLaunchData();
@@ -83,42 +93,62 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-// 1. Handle Internal Countdown (Tick every 1 second)
+  // 1. Check if it's time to swap "Data Synced" to the scrolling name
+  if (pendingNameScroll && (currentMillis - dataSyncedTime >= 2000)) {
+    pendingNameScroll = false;
+    displayScrollingName = true;
+    // Check if the name is wider than the 128px screen (6 pixels per char)
+    needsOledScroll = (globalLaunchName.length() * 6) > 128;
+    oledCursorX = needsOledScroll ? 128 : 0; // Start at right edge if scrolling, else lock to left
+    updateOLED(); // Force an immediate draw
+  }
+
+  // 2. Handle OLED Name Scrolling (Updates every 50ms if scrolling is needed)
+  if (displayScrollingName && needsOledScroll && (currentMillis - lastOledUpdateTime >= 50)) {
+    lastOledUpdateTime = currentMillis;
+    oledCursorX--;
+    int nameWidth = globalLaunchName.length() * 6;
+    if (oledCursorX < -nameWidth) {
+      oledCursorX = 128; 
+    }
+    updateOLED();
+  }
+
+  // 3. Handle Internal Countdown via Real-World Time (1 Hz Tick)
   if (isCountingDown && (currentMillis - lastTickTime >= 1000)) {
     lastTickTime = currentMillis;
     
-    // Get the current real-world Unix time
     time_t now = time(nullptr);
     
-    // Calculate the difference
     if (launchTimestamp > now) {
       timeUntilLaunch = launchTimestamp - now;
     } else {
       timeUntilLaunch = 0;
     }
 
-    // Trigger post-launch fetch if we hit zero
     if (timeUntilLaunch == 0 && !postLaunchFetchTriggered) {
       zeroHitTime = currentMillis;
       postLaunchFetchTriggered = true;
       printConsole("LIFTOFF! Awaiting API.");
     }
     
-    // Refresh the OLED screen every second to update the visual countdown
-    updateOLED(); 
+    // Only trigger the 1-second OLED refresh here if it isn't ALREADY 
+    // being refreshed every 50ms by the scrolling animation above.
+    if (!(displayScrollingName && needsOledScroll)) {
+       updateOLED(); 
+    }
   }
 
-  // 2. Fetch next launch 60 seconds after zero
+  // 4. Fetch next launch 60 seconds after zero
   if (postLaunchFetchTriggered && (currentMillis - zeroHitTime >= 60000)) {
     printConsole("Fetching next launch...");
     fetchLaunchData();
     postLaunchFetchTriggered = false; 
   }
 
-  // 3. Render LED Matrix and handle scrolling
+  // 5. Render Main LED Matrix
   updateDisplay();
   
-  // Controls scrolling speed (lower = faster)
   delay(40); 
 }
 
@@ -128,52 +158,58 @@ void updateOLED() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   
-  // 1. Draw the top 5 console lines (Standard size 1 text)
   display.setTextSize(1);
-  for(int i = 0; i < 5; i++) {
-    display.setCursor(0, i * 8); // Spaces lines 8 pixels apart vertically
+  
+  // 1. Draw the top 4 console lines (0 through 3)
+  for(int i = 0; i < 4; i++) {
+    display.setCursor(0, i * 8); 
     display.println(consoleLines[i]);
   }
   
-  // 2. Draw a sleek separator line across the screen
-  display.drawLine(0, 44, 128, 44, SSD1306_WHITE);
+  // 2. Draw either the 5th console line OR the scrolling JSON name
+  if (displayScrollingName) {
+    display.setCursor(oledCursorX, 32); 
+    display.print(globalLaunchName);
+  } else {
+    display.setCursor(0, 32);
+    display.println(consoleLines[4]);
+  }
   
-  // 3. Draw the live countdown at the bottom
+  // 3. Draw separator and Countdown Timer
+  // display.drawLine(0, 44, 128, 44, SSD1306_WHITE);
+  
   display.setCursor(4, 49); 
-  display.setTextSize(2); // Double size for readability
+  display.setTextSize(2); 
   display.print(formatCountdown(timeUntilLaunch));
   
-  // Reset text size for the next time it loops
   display.setTextSize(1); 
-  
   display.display();
 }
 
 void printConsole(String msg) {
-  Serial.println(msg); // Keep serial backup
+  Serial.println(msg); 
   
-  // Shift 5 lines up by one
+  // If a new console message arrives, turn off the scrolling name
+  // so the user can see what the console is trying to tell them.
+  displayScrollingName = false;
+  pendingNameScroll = false;
+  
   for(int i = 0; i < 4; i++) {
     consoleLines[i] = consoleLines[i+1];
   }
-  // Add new message to the bottom slot
   consoleLines[4] = msg;
   
-  // Trigger the screen update
   updateOLED();
 }
 
 void connectWiFi() {
   printConsole("Starting WiFi...");
 
-  // Clear any stalled radio states and set to Client mode
   WiFi.disconnect(true);
   delay(1000); 
   WiFi.mode(WIFI_STA);
-
   WiFi.begin(ssid, password);
   
-  // Show WiFi loading on the main LEDs
   matrix.fillScreen(0);
   matrix.setCursor(0, 0);
   matrix.setTextColor(matrix.Color(0, 0, 255));
@@ -182,31 +218,26 @@ void connectWiFi() {
 
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED) {
-    delay(1500);
+    delay(500);
     attempts++;
+    if(attempts % 4 == 0) printConsole("Still connecting...");
     
-    if(attempts % 4 == 0) {
-      printConsole("Still connecting...");
-    }
-
-    // If it hangs for 10 seconds, reboot the WiFi radio
     if (attempts > 20) {
       printConsole("Radio stuck. Retrying...");
       WiFi.disconnect(true);
       delay(1000);
       WiFi.begin(ssid, password);
-      attempts = 0; // Reset counter
+      attempts = 0; 
     }
   }
   
   printConsole("WiFi Connected!");
   printConsole("IP: " + WiFi.localIP().toString());
+  
+  // -- NTP Time Sync --
   printConsole("Syncing NTP Time...");
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov"); 
   
-  // Set time via NTP. (0 timezone offset, 0 daylight savings because Unix epoch is always UTC)
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  
-  // Wait for the time to actually sync
   time_t now = time(nullptr);
   while (now < 24 * 3600) {
     delay(500);
@@ -220,45 +251,45 @@ void fetchLaunchData() {
     printConsole("Connecting to API...");
     
     WiFiClientSecure client;
-    client.setInsecure(); // Safe for public APIs
+    client.setInsecure(); 
     
     HTTPClient http;
     http.begin(client, apiUrl);
     int httpResponseCode = http.GET();
 
     if (httpResponseCode > 0) {
-      printConsole("HTTP " + String(httpResponseCode) + " OK");
       String payload = http.getString();
       
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, payload);
 
       if (!error) {
-        String launchName = doc["name"].as<String>();
+        // Save the launch name to our global variable for the OLED scroller
+        globalLaunchName = doc["name"].as<String>();
+        
         String launchLoc = doc["location"].as<String>();
         String launchDateStr = doc["date"].as<String>();
         
         launchDateStr.replace("T", " ");
         launchDateStr.replace(":00Z", " UTC"); 
 
-        // Construct the blue text portion
-        mainText = launchName + " | " + launchLoc + " | " + launchDateStr + " | ";
+        mainText = globalLaunchName + " | " + launchLoc + " | " + launchDateStr + " | ";
         
-        // Grab the absolute Unix timestamp instead of the cached seconds
         launchTimestamp = doc["timestamp"].as<unsigned long>();
         isCountingDown = true;
         
-        printConsole("Parsed: " + launchName.substring(0, 10) + "...");
-        printConsole("Sync complete.");
-        } else {
+        // Print to console, then trigger the 2-second delay before scrolling starts
+        printConsole("Data Synced.");
+        dataSyncedTime = millis();
+        pendingNameScroll = true;
+        
+      } else {
         printConsole("JSON Error!");
       }
     } else {
       printConsole("HTTP Error: " + String(httpResponseCode));
     }
     http.end();
-  } else {
-    printConsole("Error: No WiFi!");
   }
 }
 
@@ -275,29 +306,36 @@ String formatCountdown(long seconds) {
 
 void updateDisplay() {
   matrix.fillScreen(0); 
-  matrix.setCursor(cursorX, 0);
 
-  // 1. Print main text in Blue
+  // 1. Draw Scrolling Blue Text
+  matrix.setCursor(cursorX, 0);
   matrix.setTextColor(matrix.Color(0, 0, 255)); 
   matrix.print(mainText);
 
-  // 2. Print countdown in Green (or Red if 0)
+  // 2. MASKING TRICK: Black box over the right side
+  int countdownWidth = 64; 
+  int countdownX = MATRIX_WIDTH - countdownWidth; 
+  
+  matrix.fillRect(countdownX, 0, countdownWidth, 8, matrix.Color(0, 0, 0));
+
+  // 3. Draw Static Countdown on top of the black box
   if (timeUntilLaunch > 0) {
     matrix.setTextColor(matrix.Color(0, 255, 0)); 
   } else {
     matrix.setTextColor(matrix.Color(255, 0, 0)); 
   }
-
+  matrix.setCursor(countdownX + 2, 0); 
+  
   String countdownString = formatCountdown(timeUntilLaunch);
   matrix.print(countdownString);
 
   matrix.show();
 
-  // 3. Handle scrolling math
+  // 4. Handle scrolling math
   cursorX--;
-  int totalTextWidth = (mainText.length() + countdownString.length()) * 6;
+  int textWidth = mainText.length() * 6;
   
-  if (cursorX < -totalTextWidth) {
-    cursorX = 64; // Reset to the far right side of the 64-pixel display
+  if (cursorX < -textWidth) {
+    cursorX = MATRIX_WIDTH; 
   }
 }
