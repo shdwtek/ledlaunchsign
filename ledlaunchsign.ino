@@ -14,6 +14,18 @@ const char* ssid = "SSID";
 const char* password = "PASSWORD";
 const char* apiUrl = "API_URL";
 
+// --- Custom Sprites ---
+const unsigned char rocket_bmp[] PROGMEM = {
+  0x00, 0x1C, // ........ ...***..  (Top Fin)
+  0x00, 0x3E, // ........ ..*****.  (Top Fin)
+  0x1F, 0xFF, // ...***** ********  (Body)
+  0x7F, 0xFF, // .******* ********  (Nose + Body)
+  0xFF, 0xFF, // ******** ********  (Nose + Body)
+  0x7F, 0xFF, // .******* ********  (Nose + Body)
+  0x1F, 0xFF, // ...***** ********  (Body)
+  0x00, 0x3E  // ........ ..*****.  (Bottom Fin)
+};
+
 // --- Hardware Pins ---
 #define LED_PIN 15 // GP15 (Physical Pin 20)
 
@@ -312,17 +324,31 @@ void updateDisplay() {
   matrix.setTextColor(matrix.Color(0, 0, 255)); 
   matrix.print(mainText);
 
-  // 2. MASKING TRICK: Black box over the right side
+  int textWidth = mainText.length() * 6;
+  
+  // 2. Draw the Rocket Sprite in the gap!
+  // Places the rocket 30 pixels after the end of the text
+  int rocketX = cursorX + textWidth + 30; 
+  
+  // Draw the solid white rocket body (16px wide, 8px high)
+  matrix.drawBitmap(rocketX, 0, rocket_bmp, 16, 8, matrix.Color(255, 255, 255));
+  
+  // Draw a flickering orange/red flame shooting out the back (to the right of the rocket)
+  // random(3, 8) makes the flame physically flutter in length every frame
+  matrix.fillRect(rocketX + 16, 2, random(3, 8), 4, matrix.Color(255, random(50, 150), 0));
+
+  // 3. MASKING TRICK: Black box over the right side
   int countdownWidth = 64; 
   int countdownX = MATRIX_WIDTH - countdownWidth; 
   
+  // Draws solid black to obliterate the blue text and rocket moving behind it
   matrix.fillRect(countdownX, 0, countdownWidth, 8, matrix.Color(0, 0, 0));
 
-  // 3. Draw Static Countdown on top of the black box
+  // 4. Draw Static Countdown
   if (timeUntilLaunch > 0) {
-    matrix.setTextColor(matrix.Color(0, 255, 0)); 
+    matrix.setTextColor(matrix.Color(0, 255, 0), matrix.Color(0, 0, 0)); 
   } else {
-    matrix.setTextColor(matrix.Color(255, 0, 0)); 
+    matrix.setTextColor(matrix.Color(255, 0, 0), matrix.Color(0, 0, 0)); 
   }
   matrix.setCursor(countdownX + 2, 0); 
   
@@ -331,11 +357,13 @@ void updateDisplay() {
 
   matrix.show();
 
-  // 4. Handle scrolling math
+  // 5. Handle scrolling math
   cursorX--;
-  int textWidth = mainText.length() * 6;
   
-  if (cursorX < -textWidth) {
+  // Update the reset boundary so it waits for the text, the gap, the rocket, AND the flame to pass
+  int totalScrollWidth = textWidth + 30 + 16 + 10; 
+  
+  if (cursorX < -totalScrollWidth) {
     cursorX = MATRIX_WIDTH; 
   }
 }
