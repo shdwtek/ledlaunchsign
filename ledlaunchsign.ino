@@ -312,7 +312,14 @@ String formatCountdown(long seconds) {
   int s = seconds % 60;
   
   char buf[20];
-  sprintf(buf, "T-%02d:%02d:%02d", h, m, s);
+  
+  // If the hours are triple digits, drop the 'T' to save space
+  if (h >= 100) {
+    sprintf(buf, "-%d:%02d:%02d", h, m, s); 
+  } else {
+    sprintf(buf, "T-%02d:%02d:%02d", h, m, s);
+  }
+  
   return String(buf);
 }
 
